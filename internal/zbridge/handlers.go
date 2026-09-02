@@ -81,8 +81,17 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = "glm-4.7"
 	}
+	// Friendly names Z.AI's web UI shows, mapped onto the upstream ids the
+	// /api/models catalog actually serves.
+	switch model {
+	case "glm-5.3-flash":
+		model = "x-preview-l" // GLM-5.3-Flash: "Lightweight flagship, instant response"
+	case "glm-5-turbo":
+		model = "GLM-5-Turbo"
+	case "glm-5v-turbo":
+		model = "GLM-5v-Turbo"
+	}
 	access.model = model
-
 	var messages []Message
 	if err := json.Unmarshal(body.Messages, &messages); err != nil || len(messages) == 0 {
 		access.fail(400, "messages missing or not an array")
