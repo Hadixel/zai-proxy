@@ -132,7 +132,8 @@ Every completion spends one Aliyun device token, and tokens expire after a few
 days — when the stock empties, completions fail with captcha errors. No collector
 or farming involved: the tokens come from your own logged-in browser session.
 
-1. Open `https://chat.z.ai`, log in, send one message (loads the captcha SDK).
+1. Open `https://chat.z.ai` and log in (no need to send a message; the snippet
+   loads Aliyun's captcha SDK itself if the page hasn't).
 2. Paste [`feed-tokens.js`](feed-tokens.js) into the browser console (F12).
 3. It mints tokens via the same Aliyun SDK the site itself uses and POSTs them
    to `POST /admin/tokens` (Bearer = your `AUTH_TOKEN`). Refresh the tab to stop.
