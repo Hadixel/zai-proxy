@@ -1,0 +1,16 @@
+.git
+.gitignore
+.assets
+image-gen
+installer
+cmd/glm-tray
+logs
+make.ps1
+*.exe
+*.log
+tokens.sqlite
+tokens.sqlite-shm
+tokens.sqlite-wal
+*.sqlite
+.env
+README.md
