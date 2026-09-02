@@ -590,6 +590,60 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// browserTokensHandler accepts device tokens minted by the user's own chat.z.ai
+// browser session (Aliyun captcha SDK's z_um.getToken()) and feeds them into
+// the same store the collector used. Auth-protected like the other /admin
+// routes. GET reports stock; POST {token | tokens: [...]} inserts, deduped.
+func browserTokensHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, 200, map[string]interface{}{"deviceTokens": getTokenCount()})
+	case http.MethodPost:
+		var body struct {
+			Token  string   `json:"token"`
+			Tokens []string `json:"tokens"`
+		}
+		if err := decodeRequestBody(r, &body); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		list := body.Tokens
+		if body.Token != "" {
+			list = append(list, body.Token)
+		}
+		if len(list) == 0 {
+			writeJSON(w, 400, map[string]string{"error": "no token given (field: token or tokens[])"})
+			return
+		}
+		inserted, skipped := 0, 0
+		var lastErr error
+		for _, t := range list {
+			ok, err := InsertDeviceToken(t)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if ok {
+				inserted++
+			} else {
+				skipped++
+			}
+		}
+		if inserted == 0 && lastErr != nil {
+			writeJSON(w, 500, map[string]string{"error": lastErr.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{
+			"inserted":   inserted,
+			"duplicates": skipped,
+			"stock":      getTokenCount(),
+		})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+	}
+}
+
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	session.mu.Lock()
 	initialized := session.Initialized

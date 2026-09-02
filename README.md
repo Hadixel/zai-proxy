@@ -126,6 +126,20 @@ curl -s http://localhost:3007/v1/chat/completions \
 
 Anthropic-style clients: `POST /v1/messages` works the same way.
 
+## Keeping the device-token stock topped up
+
+Every completion spends one Aliyun device token, and tokens expire after a few
+days — when the stock empties, completions fail with captcha errors. No collector
+or farming involved: the tokens come from your own logged-in browser session.
+
+1. Open `https://chat.z.ai`, log in, send one message (loads the captcha SDK).
+2. Paste [`feed-tokens.js`](feed-tokens.js) into the browser console (F12).
+3. It mints tokens via the same Aliyun SDK the site itself uses and POSTs them
+   to `POST /admin/tokens` (Bearer = your `AUTH_TOKEN`). Refresh the tab to stop.
+4. Check stock: `curl -s http://localhost:3007/admin/tokens -H "Authorization: Bearer $AUTH_TOKEN"`
+
+The proxy claims newest tokens first, dedupes, and caps the store at 512.
+
 ## Notes & risks
 
 - **`AUTH_TOKEN` matters.** Without it (or with the dev default) anyone who can reach

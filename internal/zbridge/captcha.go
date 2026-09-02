@@ -22,11 +22,12 @@ import (
 )
 
 // Device token store. Each captcha verification spends exactly one token, so an
-// empty store fails every completion until the collector refills it.
-
+// empty store fails every completion until the store is refilled — by the
+// collector, or by a browser session POSTing to /admin/tokens.
 var (
-	stmtClaimToken *sql.Stmt
-	stmtCountToken *sql.Stmt
+	stmtClaimToken  *sql.Stmt
+	stmtCountToken  *sql.Stmt
+	stmtInsertToken *sql.Stmt
 
 	// Caches SELECT COUNT(*) so /health, /metrics and the monitor do not each
 	// drive an index scan.
@@ -82,7 +83,7 @@ func initDB() error {
 	// Claim and delete in one statement, so two concurrent generators can never
 	// receive the same token.
 	claim, err := db.Prepare(
-		`DELETE FROM tokens WHERE id = (SELECT id FROM tokens ORDER BY id LIMIT 1) RETURNING token`)
+		`DELETE FROM tokens WHERE id = (SELECT id FROM tokens ORDER BY id DESC LIMIT 1) RETURNING token`)
 	if err != nil {
 		db.Close()
 		return fmt.Errorf("prepare token claim: %w", err)
@@ -93,8 +94,15 @@ func initDB() error {
 		db.Close()
 		return fmt.Errorf("prepare token count: %w", err)
 	}
+	insert, err := db.Prepare(`INSERT INTO tokens(token, batch) VALUES (?, ?)`)
+	if err != nil {
+		claim.Close()
+		count.Close()
+		db.Close()
+		return fmt.Errorf("prepare token insert: %w", err)
+	}
 
-	globalDB, stmtClaimToken, stmtCountToken = db, claim, count
+	globalDB, stmtClaimToken, stmtCountToken, stmtInsertToken = db, claim, count, insert
 	refreshTokenCount()
 	return nil
 }
@@ -134,10 +142,16 @@ func closeDB() {
 		globalDB.Close()
 		globalDB = nil
 	}
+	if stmtInsertToken != nil {
+		stmtInsertToken.Close()
+		stmtInsertToken = nil
+	}
 }
 
-// claimToken removes and returns the oldest token. Tokens are single-use, so
-// claiming and deleting are one operation.
+// claimToken removes and returns the newest token. Tokens are single-use, so
+// claiming and deleting are one operation. Newest first, because browser-fed
+// tokens (batch 0) are the only reliably alive ones once an older batch starts
+// failing Aliyun's risk checks.
 func claimToken() (string, bool) {
 	if stmtClaimToken == nil {
 		logError("token store is not open")
@@ -162,6 +176,38 @@ func claimToken() (string, bool) {
 	}
 	metrics.tokensConsumed.Add(1)
 	return token, true
+}
+
+// tokenStoreCap bounds the store so a forgotten snippet loop cannot grow it
+// without limit.
+const tokenStoreCap = 512
+
+// InsertDeviceToken stores a token minted outside the collector (browser
+// console /admin/tokens flow), deduped, evicting the oldest rows at the cap.
+func InsertDeviceToken(token string) (inserted bool, err error) {
+	if globalDB == nil || stmtInsertToken == nil {
+		return false, fmt.Errorf("token store is not open")
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false, fmt.Errorf("empty token")
+	}
+	var dup int
+	if err := globalDB.QueryRow(`SELECT COUNT(*) FROM tokens WHERE token = ?`, token).Scan(&dup); err != nil {
+		return false, err
+	}
+	if dup > 0 {
+		return false, nil
+	}
+	if _, err := stmtInsertToken.Exec(token, 0); err != nil {
+		return false, err
+	}
+	if _, err := globalDB.Exec(`DELETE FROM tokens WHERE id NOT IN
+		(SELECT id FROM tokens ORDER BY id DESC LIMIT ?)`, tokenStoreCap); err != nil {
+		logError("token store trim failed: " + err.Error())
+	}
+	refreshTokenCount()
+	return true, nil
 }
 
 // getTokenCount reports tokens left, from a short-TTL cache so status endpoints

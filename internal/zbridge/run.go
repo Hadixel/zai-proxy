@@ -44,6 +44,7 @@ func NewHandler() http.Handler {
 	// Authenticated: the listener binds 0.0.0.0 by default, so these would
 	// otherwise hand internal state to anyone who can reach the port.
 	mux.HandleFunc("/admin/stats", authMiddleware(statsHandler))
+	mux.HandleFunc("/admin/tokens", authMiddleware(browserTokensHandler))
 	mux.HandleFunc("/admin/health", authMiddleware(healthHandler))
 	mux.HandleFunc("/admin/clients", authMiddleware(clientsHandler))
 	mux.HandleFunc("/metrics", authMiddleware(metricsHandler))
