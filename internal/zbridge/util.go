@@ -24,6 +24,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	http2 "golang.org/x/net/http2"
 	proxy "golang.org/x/net/proxy"
 )
 
@@ -57,35 +58,106 @@ var zlibWriterPool = sync.Pool{
 // endpoints block some ISP ranges outright, while chat.z.ai itself stays
 // reachable directly — so the captcha path carries its own proxy setting,
 // independent from the general HTTPS_PROXY used by the chat upstream.
+// Aliyun's captcha endpoint speaks HTTP/2 only and its WAF stalls Go's default
+// TLS fingerprint, so the captcha client is a custom round tripper: uTLS with a
+// Chrome ClientHello (through ALIYUN_PROXY when set), then x/net/http2 over the
+// negotiated connection.
 var aliyunHTTPClient = &http.Client{
-	Transport: &http.Transport{
-		Proxy: func(*http.Request) (*url.URL, error) {
-			raw := os.Getenv("ALIYUN_PROXY")
-			if raw == "" {
-				return nil, nil
-			}
-			return url.Parse(raw)
-		},
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		MaxConnsPerHost:       20,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
-		ForceAttemptHTTP2:     true,
+	Transport: &uTLSH2Transport{
+		Dial: dialAliyunTLS,
+		H2:   &http2.Transport{},
 	},
-	Timeout: 30 * time.Second,
+	Timeout: 60 * time.Second,
 }
 
-// TLS fingerprint spoofing: uTLS with a Chrome ClientHello.
-//
-// Aliyun's ESA WAF fingerprints JA3 and blocks Go's default TLS stack.
+// uTLSH2Transport runs each request over a freshly dialed uTLS connection when
+// the negotiated protocol is h2, reusing http2.Transport's connection pool for
+// subsequent requests on that conn.
+type uTLSH2Transport struct {
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	H2   *http2.Transport
+}
 
-// Shared, because a net.Dialer holds no per-connection state.
-var utlsDialer = &net.Dialer{
-	Timeout:   15 * time.Second,
-	KeepAlive: 30 * time.Second,
+func (t *uTLSH2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	addr := canonicalAddr(req.URL)
+	// The local socks tunnel drops TLS handshakes regularly; dial with a few
+	// quick retries instead of surfacing every flake to the captcha loop.
+	var conn net.Conn
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		conn, err = t.Dial(req.Context(), "tcp", addr)
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	if err != nil {
+		return nil, err
+	}
+	u, ok := conn.(*utls.UConn)
+	if !ok || !strings.HasPrefix(u.ConnectionState().NegotiatedProtocol, "h2") {
+		conn.Close()
+		return nil, fmt.Errorf("aliyun: server did not negotiate h2 (got %q)",
+			u.ConnectionState().NegotiatedProtocol)
+	}
+	// ServeConn returns a RoundTripper bound to this single h2 connection.
+	rt, err := t.H2.NewClientConn(conn)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return resp, nil
+}
+
+func canonicalAddr(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "http" {
+			return u.Host + ":80"
+		}
+		return u.Host + ":443"
+	}
+	return u.Host
+}
+
+// dialAliyunTLS opens the TLS connection for the captcha client: uTLS with a
+// Chrome ClientHello, through ALIYUN_PROXY when set (socks5 or HTTP CONNECT),
+// direct otherwise. ALPN negotiates h2 when the server offers it.
+func dialAliyunTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	var rawConn net.Conn
+	if raw := os.Getenv("ALIYUN_PROXY"); raw != "" {
+		if proxyURL, perr := url.Parse(raw); perr == nil && proxyURL.Host != "" {
+			rawConn, err = dialViaProxy(ctx, proxyURL, addr)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if rawConn == nil {
+		rawConn, err = utlsDialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	uConn := utls.UClient(rawConn, &utls.Config{
+		ServerName:         host,
+		NextProtos:         []string{"h2", "http/1.1"},
+		InsecureSkipVerify: false,
+	}, utls.HelloChrome_120)
+	if err := uConn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	return uConn, nil
 }
 
 // Resolved once, not six env lookups per dial.
@@ -104,6 +176,28 @@ var proxyForUpstream = sync.OnceValue(func() *url.URL {
 	}
 	return nil
 })
+
+// Shared, because a net.Dialer holds no per-connection state. PreferGo pushes
+// resolution through Go's own resolver: the cgo path deadlocks against
+// systemd-resolved under load and burns whole request budgets on "lookup i/o
+// timeout". Dial-level fallbacks cover resolved being wedged entirely.
+var utlsDialer = &net.Dialer{
+	Timeout:   15 * time.Second,
+	KeepAlive: 30 * time.Second,
+	Resolver: &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: 3 * time.Second}
+			for _, ns := range []string{"127.0.0.53:53", "1.1.1.1:53", "8.8.8.8:53"} {
+				conn, err := d.DialContext(ctx, network, ns)
+				if err == nil {
+					return conn, nil
+				}
+			}
+			return nil, fmt.Errorf("no DNS server reachable")
+		},
+	},
+}
 
 // dialUTLS opens a TLS connection with a Chrome ClientHello, tunnelling through
 // HTTP(S)_PROXY when set.
@@ -553,7 +647,7 @@ func redactSecret(s string) string {
 // Control hook, which sees the peer the connection actually uses — resolving the name
 // separately is a TOCTOU a rebinding record walks straight through.
 var imageFetchClient = &http.Client{
-	Timeout: 30 * time.Second,
+	Timeout: 45 * time.Second,
 	Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
