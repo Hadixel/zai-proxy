@@ -227,6 +227,16 @@ func Run() {
 	// re-arms default handling.
 	ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
+	// The frontend version rotates under a fixed name every few days; a stale
+	// one gets chat requests WAF-blocked with 405s. Re-scrape hourly — cheap,
+	// and the scrape itself rides the upstream client.
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for range t.C {
+			scrapeConfig()
+		}
+	}()
 
 	select {
 	case err := <-serveErr:

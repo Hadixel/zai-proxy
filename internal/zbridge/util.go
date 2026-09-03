@@ -160,8 +160,15 @@ func dialAliyunTLS(ctx context.Context, network, addr string) (net.Conn, error) 
 	return uConn, nil
 }
 
-// Resolved once, not six env lookups per dial.
+// Resolved once, not six env lookups per dial. ZAI_PROXY wins over the generic
+// vars: Z.AI's WAF blocks some residential ISPs directly while the tunnel exit
+// passes, so chat can need the tunnel even when ALIYUN_PROXY alone is set.
 var proxyForUpstream = sync.OnceValue(func() *url.URL {
+	if raw := os.Getenv("ZAI_PROXY"); raw != "" {
+		if u, err := url.Parse(raw); err == nil && u.Host != "" {
+			return u
+		}
+	}
 	for _, key := range []string{
 		"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
 		"https_proxy", "http_proxy", "all_proxy",
